@@ -21,7 +21,7 @@ from keep_alive import keep_alive
 
 # CONFIG
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 MAX_TELEGRAM_MB = 50
 MAX_TELEGRAM_BYTES = MAX_TELEGRAM_MB * 1024 * 1024
 
