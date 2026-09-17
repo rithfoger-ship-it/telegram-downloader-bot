@@ -2,7 +2,8 @@ import os
 import logging
 import asyncio
 import json
-import requests
+import urllib.request
+import urllib.parse
 import shutil
 from pathlib import Path
 from dotenv import load_dotenv
@@ -22,7 +23,9 @@ from keep_alive import keep_alive
 # CONFIG
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_ID = 123456789  # ⚠️ ជំនួសដោយ Telegram User ID របស់បង
+
+# ⚠️ ដាក់ Telegram ID របស់បងនៅទីនេះ (យកពី @userinfobot)
+ADMIN_ID = 1160495039  
 
 MAX_TELEGRAM_MB = 50
 MAX_TELEGRAM_BYTES = MAX_TELEGRAM_MB * 1024 * 1024
@@ -39,55 +42,62 @@ SUPPORTED_HINTS = ("tiktok.com", "facebook.com", "fb.watch", "youtube.com", "you
 def is_supported_url(text: str) -> bool:
     return any(h in text for h in SUPPORTED_HINTS)
 
-# USERS TRACKING
+# FUNCTIONS សម្រាប់គ្រប់គ្រងអ្នកប្រើប្រាស់ (USERS TRACKING)
 def log_user(user_id: int):
     users = set()
     if USERS_FILE.exists():
         try:
             with open(USERS_FILE, "r") as f:
                 users = set(json.load(f))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error reading users file: {e}")
+    
     if user_id not in users:
         users.add(user_id)
         try:
             with open(USERS_FILE, "w") as f:
                 json.dump(list(users), f)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error writing users file: {e}")
 
 def get_user_count() -> int:
     if USERS_FILE.exists():
         try:
             with open(USERS_FILE, "r") as f:
                 return len(json.load(f))
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error reading users count: {e}")
             return 0
     return 0
 
-# TIKTOK FETCHER (កែប្រែថ្មីប្រើ Requests + Clean URL)
+# TIKTOK & YT-DLP HELPERS
+def expand_url(url: str) -> str:
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.geturl()
+    except Exception as e:
+        logger.error(f"Expand URL failed: {e}")
+        return url
+
 def fetch_tiktok_tikwm(url: str):
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        full_url = expand_url(url)
         
-        # ១. Expand Short Link
-        resp = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
-        full_url = resp.url
-        
-        # ២. សម្អាត URL និងបម្លែង /photo/ ទៅ /video/
-        if "?" in full_url:
-            full_url = full_url.split("?")[0]
+        # បម្លែង /photo/ ទៅជា /video/ ដើម្បីឱ្យ Tikwm API អានស្គាល់
         if "/photo/" in full_url:
             full_url = full_url.replace("/photo/", "/video/")
             
-        # ៣. Call Tikwm API
-        api_url = f"https://www.tikwm.com/api/?url={full_url}"
-        api_res = requests.get(api_url, headers=headers, timeout=15).json()
-        
-        if api_res.get("code") == 0:
-            return api_res.get("data")
+        api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(full_url)}"
+        req = urllib.request.Request(
+            api_url,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            if response.status == 200:
+                res_data = json.loads(response.read().decode('utf-8'))
+                if res_data.get("code") == 0:
+                    return res_data.get("data")
     except Exception as e:
         logger.error(f"Tikwm API error: {e}")
     return None
@@ -131,16 +141,18 @@ def collect_downloaded_files(info: dict, out_dir: Path) -> list[Path]:
             files.append(f)
     return files
 
-# HANDLERS
+# COMMAND HANDLERS
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         log_user(update.effective_user.id)
+
     await update.message.reply_text(
         "👋 Welcome! Send me a link from TikTok, Facebook, YouTube, or Instagram\n"
         "and I will download videos, photos, or slideshows for you."
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # បញ្ជា /stats សម្រាប់តែ Admin
     if update.effective_user and update.effective_user.id == ADMIN_ID:
         total_users = get_user_count()
         await update.message.reply_text(
@@ -162,7 +174,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = text.strip()
     status = await update.message.reply_text("📥 Processing your link, please wait...")
 
-    # 1. SPECIAL TIKTOK HANDLING
+    # 1. SPECIAL TIKTOK HANDLING (Tikwm API for Video & Photos)
     if any(domain in url for domain in ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"]):
         try:
             data = await asyncio.to_thread(fetch_tiktok_tikwm, url)
@@ -171,8 +183,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 images = data.get("images", [])
                 if images:
                     await status.edit_text("📸 Sending photos...")
-                    formatted_images = ["https:" + img if img.startswith("//") else img for img in images]
+                    formatted_images = []
+                    for img in images:
+                        if img.startswith("//"):
+                            img = "https:" + img
+                        formatted_images.append(img)
                     
+                    # ផ្ញើចេញម្តងអតិបរមា ១០ រូប
                     for i in range(0, len(formatted_images), 10):
                         chunk = formatted_images[i:i + 10]
                         media_group = [InputMediaPhoto(media=img_url) for img_url in chunk]
@@ -191,9 +208,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await status.delete()
                     return
         except Exception as e:
-            logger.error(f"TikTok API processing error: {e}")
+            logger.error(f"TikTok Direct API processing error: {e}")
 
-    # 2. FALLBACK TO YT-DLP FOR FB/YT/IG
+    # 2. FALLBACK TO YT-DLP FOR OTHER PLATFORMS (FB/YT/IG)
     work_dir = Path(os.getcwd()) / "downloads" / str(update.message.message_id)
     work_dir.mkdir(parents=True, exist_ok=True)
 
