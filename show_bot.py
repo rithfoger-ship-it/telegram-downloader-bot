@@ -4,6 +4,7 @@ import asyncio
 import json
 import urllib.request
 import urllib.parse
+import shutil
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -36,7 +37,6 @@ SUPPORTED_HINTS = ("tiktok.com", "facebook.com", "fb.watch", "youtube.com", "you
 def is_supported_url(text: str) -> bool:
     return any(h in text for h in SUPPORTED_HINTS)
 
-# Function ពន្លាត Short Link (vt.tiktok.com) ឱ្យទៅជា Link វែង
 def expand_url(url: str) -> str:
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -46,7 +46,6 @@ def expand_url(url: str) -> str:
         logger.error(f"Expand URL failed: {e}")
         return url
 
-# TikTok Fetcher ដោយប្រើ Tikwm API (គាំទ្រទាំង Video & Photo Album)
 def fetch_tiktok_tikwm(url: str):
     try:
         full_url = expand_url(url)
@@ -106,37 +105,49 @@ def collect_downloaded_files(info: dict, out_dir: Path) -> list[Path]:
 # HANDLERS
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me a link from TikTok, Facebook, YouTube or Instagram\n"
-        "and I'll download it for you (video/photo/slideshow)."
+        "👋 Welcome! Send me a link from TikTok, Facebook, YouTube, or Instagram\n"
+        "and I will download videos, photos, or slideshows for you."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     if not is_supported_url(text):
-        await update.message.reply_text("Please send a valid link from TikTok / Facebook / YouTube / Instagram.")
+        await update.message.reply_text("Please send a valid link from TikTok, Facebook, YouTube, or Instagram.")
         return
 
     url = text.strip()
-    status = await update.message.reply_text("Downloading...")
+    status = await update.message.reply_text("📥 Processing your link, please wait...")
 
-    # 1. SPECIAL TIKTOK HANDLING (Tikwm API)
+    # 1. SPECIAL TIKTOK HANDLING (Tikwm API for Video & Photos)
     if any(domain in url for domain in ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"]):
         try:
             data = await asyncio.to_thread(fetch_tiktok_tikwm, url)
             if data:
-                # ករណីជា Photo Album (Slideshow)
+                # Photos / Slideshow
                 images = data.get("images", [])
                 if images:
-                    await status.edit_text("Sending photos...")
-                    media_group = [InputMediaPhoto(media=img) for img in images[:10]]
-                    await update.message.reply_media_group(media=media_group)
+                    await status.edit_text("📸 Sending photos...")
+                    formatted_images = []
+                    for img in images:
+                        if img.startswith("//"):
+                            img = "https:" + img
+                        formatted_images.append(img)
+                    
+                    # Send in batches of 10 max per album
+                    for i in range(0, len(formatted_images), 10):
+                        chunk = formatted_images[i:i + 10]
+                        media_group = [InputMediaPhoto(media=img_url) for img_url in chunk]
+                        await update.message.reply_media_group(media=media_group)
+                    
                     await status.delete()
                     return
 
-                # ករណីជា Video
+                # Video
                 video_url = data.get("play") or data.get("wmplay")
                 if video_url:
-                    await status.edit_text("Sending video...")
+                    if video_url.startswith("//"):
+                        video_url = "https:" + video_url
+                    await status.edit_text("🎥 Sending video...")
                     await update.message.reply_video(video=video_url)
                     await status.delete()
                     return
@@ -152,17 +163,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files = collect_downloaded_files(info, work_dir)
 
         if not files:
-            await status.edit_text("Sorry, download failed (bad link or private video).")
+            await status.edit_text("❌ Sorry, download failed (invalid link or private video).")
             return
 
-        await status.edit_text(f"Got {len(files)} file(s). Sending...")
+        await status.edit_text(f"📤 Got {len(files)} file(s). Uploading to Telegram...")
         for f in files:
             if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
                 with open(f, "rb") as photo_file:
                     await update.message.reply_photo(photo=photo_file)
             else:
                 if f.stat().st_size > MAX_TELEGRAM_BYTES:
-                    await update.message.reply_text(f"Warning: {f.name} is over 50MB and cannot be sent via Telegram Bot API.")
+                    await update.message.reply_text(f"⚠️ Warning: {f.name} exceeds 50MB limit for Telegram bots.")
                     continue
                 with open(f, "rb") as video_file:
                     await update.message.reply_video(video=video_file, supports_streaming=True)
@@ -171,15 +182,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("Download failed")
-        await status.edit_text(f"Something went wrong: {e}")
+        await status.edit_text(f"❌ Something went wrong: {e}")
 
     finally:
-        import shutil
         shutil.rmtree(work_dir, ignore_errors=True)
 
 def main():
-    if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
-        raise RuntimeError("Please set BOT_TOKEN (env var or .env file) before running the bot")
+    if not BOT_TOKEN:
+        raise RuntimeError("Please set BOT_TOKEN in environment variables.")
 
     keep_alive()
 
