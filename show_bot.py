@@ -23,8 +23,13 @@ from keep_alive import keep_alive
 # CONFIG
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+
+# ⚠️ ដាក់ Telegram ID របស់បងនៅទីនេះ (យកពី @userinfobot)
+ADMIN_ID = 1160495039  
+
 MAX_TELEGRAM_MB = 50
 MAX_TELEGRAM_BYTES = MAX_TELEGRAM_MB * 1024 * 1024
+USERS_FILE = Path(__file__).parent / "users.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -37,6 +42,35 @@ SUPPORTED_HINTS = ("tiktok.com", "facebook.com", "fb.watch", "youtube.com", "you
 def is_supported_url(text: str) -> bool:
     return any(h in text for h in SUPPORTED_HINTS)
 
+# FUNCTIONS សម្រាប់គ្រប់គ្រងអ្នកប្រើប្រាស់ (USERS TRACKING)
+def log_user(user_id: int):
+    users = set()
+    if USERS_FILE.exists():
+        try:
+            with open(USERS_FILE, "r") as f:
+                users = set(json.load(f))
+        except Exception as e:
+            logger.error(f"Error reading users file: {e}")
+    
+    if user_id not in users:
+        users.add(user_id)
+        try:
+            with open(USERS_FILE, "w") as f:
+                json.dump(list(users), f)
+        except Exception as e:
+            logger.error(f"Error writing users file: {e}")
+
+def get_user_count() -> int:
+    if USERS_FILE.exists():
+        try:
+            with open(USERS_FILE, "r") as f:
+                return len(json.load(f))
+        except Exception as e:
+            logger.error(f"Error reading users count: {e}")
+            return 0
+    return 0
+
+# TIKTOK & YT-DLP HELPERS
 def expand_url(url: str) -> str:
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -49,6 +83,11 @@ def expand_url(url: str) -> str:
 def fetch_tiktok_tikwm(url: str):
     try:
         full_url = expand_url(url)
+        
+        # បម្លែង /photo/ ទៅជា /video/ ដើម្បីឱ្យ Tikwm API អានស្គាល់
+        if "/photo/" in full_url:
+            full_url = full_url.replace("/photo/", "/video/")
+            
         api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(full_url)}"
         req = urllib.request.Request(
             api_url,
@@ -102,14 +141,31 @@ def collect_downloaded_files(info: dict, out_dir: Path) -> list[Path]:
             files.append(f)
     return files
 
-# HANDLERS
+# COMMAND HANDLERS
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        log_user(update.effective_user.id)
+
     await update.message.reply_text(
         "👋 Welcome! Send me a link from TikTok, Facebook, YouTube, or Instagram\n"
         "and I will download videos, photos, or slideshows for you."
     )
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # បញ្ជា /stats សម្រាប់តែ Admin
+    if update.effective_user and update.effective_user.id == ADMIN_ID:
+        total_users = get_user_count()
+        await update.message.reply_text(
+            f"📊 **Bot Statistics**\n\n👤 Total Users: `{total_users}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text("⚠️ You are not authorized to use this command.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        log_user(update.effective_user.id)
+
     text = update.message.text or ""
     if not is_supported_url(text):
         await update.message.reply_text("Please send a valid link from TikTok, Facebook, YouTube, or Instagram.")
@@ -133,7 +189,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             img = "https:" + img
                         formatted_images.append(img)
                     
-                    # Send in batches of 10 max per album
+                    # ផ្ញើចេញម្តងអតិបរមា ១០ រូប
                     for i in range(0, len(formatted_images), 10):
                         chunk = formatted_images[i:i + 10]
                         media_group = [InputMediaPhoto(media=img_url) for img_url in chunk]
@@ -202,6 +258,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot starting...")
